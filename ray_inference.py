@@ -1,5 +1,5 @@
 # Databricks notebook source
-# MAGIC %pip install "segment-geospatial[samgeo2]==0.13.0" rasterio==1.4.3 supervision==0.27.0 "ray[data]==2.41.0"
+# MAGIC %pip install "segment-geospatial[samgeo2]==0.13.0" rasterio==1.4.3 supervision==0.27.0 "ray[data]==2.41.0" opencv-python==4.12.0.88 opencv-python-headless==4.12.0.88
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -269,8 +269,6 @@ data = spark.createDataFrame(dbutils.fs.ls(source_dir))\
   .withColumn("image_path", F.expr("substring(path, 6, length(path))"))\
   .withColumn("text_prompt", F.lit(text_prompt))
 
-
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -296,7 +294,7 @@ ds = ds.map_batches(
 ds = ds.map_batches(
     BBoxPredictorStep,
     concurrency=(1, 1 + max_worker_nodes),
-    batch_size=4,
+    batch_size=4 * 5,
     num_gpus=0.75, # Request 50% of a GPU (~20GB on an A100/40GB)
 )
 
@@ -307,7 +305,7 @@ ds = ds.map_batches(
 ds = ds.map_batches(
     SegmenterStep,
     concurrency=(1, 1 + max_worker_nodes),
-    batch_size=8,
+    batch_size=8 * 5,
     num_gpus=0.2, # Request 40% of a GPU (~16GB on an A100/40GB)
 )
 
@@ -346,6 +344,6 @@ spark.table(tref).display()
 
 from base64 import b64encode
 
-png_bytes = spark.table(tref).select("mask").sort("image_path", ascending=False).first().mask
+png_bytes = spark.table(tref).select("mask").sort("image_path", ascending=True).first().mask
 
 displayHTML(f'<img src="data:image/png;base64,{b64encode(png_bytes).decode("ascii")}" height=300/>')
