@@ -48,7 +48,7 @@ def polygonize_mask(masks: pd.Series, transforms: pd.Series) -> pd.Series:
     row_polygons = []
 
     nparr = np.frombuffer(mask, np.uint8)
-    decoded_mask = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+    decoded_mask = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
 
     if decoded_mask is None:
         results.append([])

@@ -173,10 +173,18 @@ class BBoxPredictorStep:
 
 # This class loads the SAM2 model and generates segmentation masks.
 class SegmenterStep:
+
+    SAM_MODEL = "sam2-hiera-small"
+    WORKING_TYPE = np.uint32
+    TARGET_TYPE = np.uint16
+    MAX_VAL = np.iinfo(TARGET_TYPE).max
+    SUB_BATCH_SIZE = 50
+    KERNEL_SIZE = 5
+
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        sam_model = "sam2-hiera-small"
-        self.sam = SamGeo2(model_id=sam_model, device=self.device, automatic=False)
+        
+        self.sam = SamGeo2(model_id=self.SAM_MODEL, device=self.device, automatic=False)
         print("SegmenterStep initialized on device:", self.device)
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
@@ -185,7 +193,7 @@ class SegmenterStep:
         1. Closing: Fills small holes and bridges gaps (fixes fragmentation).
         2. Opening: Removes small speckles/noise (fixes false positives).
         """
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((self.KERNEL_SIZE, self.KERNEL_SIZE), np.uint8)
         
         cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
@@ -203,39 +211,51 @@ class SegmenterStep:
         for i in range(len(batch["image_path"])):
             rgb_array = batch["rgb_image_array"][i]
             original_np = batch["original_image_np"][i]
-            boxes_input = batch["boxes"][i]
-            if isinstance(boxes_input, np.ndarray):
-                boxes_input = boxes_input.tolist()
+            raw_boxes = batch["boxes"][i]
+            if raw_boxes is None or len(raw_boxes) == 0:
+                boxes_np = np.empty((0, 4), dtype=np.float32)
+            else:
+                if isinstance(raw_boxes, (list, tuple, np.ndarray)):
+                    processed_boxes = [
+                        b.tolist() if hasattr(b, "tolist") else b 
+                        for b in raw_boxes
+                    ]
+                    boxes_np = np.array(processed_boxes, dtype=np.float32)
+                else:
+                    boxes_np = np.atleast_2d(np.array(raw_boxes, dtype=np.float32))
+            boxes_np = np.atleast_2d(boxes_np)
+            num_boxes = boxes_np.shape[0]
+            
+            mask_overlay = np.zeros(original_np.shape[:2], dtype=self.WORKING_TYPE)
 
-            boxes = torch.tensor(boxes_input) # Convert list back to tensor
-
-            h, w = rgb_array.shape[:2]
-            mask_overlay = np.zeros((h, w), dtype=np.uint8)
-
-            if boxes.nelement() > 0:
+            if num_boxes > 0:
                 image_pil = Image.fromarray(rgb_array)
                 self.sam.set_image(image_pil)
-                masks, _, _ = self.sam.predict(
-                    boxes=boxes.numpy().tolist(),
-                    multimask_output=False,
-                    return_results=True
-                    )
+
+                for k in range(0, num_boxes, self.SUB_BATCH_SIZE):
+                    sub_boxes = boxes_np[k:k+self.SUB_BATCH_SIZE]
+                    masks, _, _ = self.sam.predict(
+                        boxes=sub_boxes,
+                        multimask_output=False,
+                        return_results=True
+                        )
                 
-                if masks.ndim == 4 and masks.shape[1] == 1:
-                    masks = masks.squeeze(1)
+                    if masks.ndim == 4 and masks.shape[1] == 1:
+                        masks = masks.squeeze(1)
 
-                mask_overlay = np.zeros_like(original_np[..., 0], dtype=np.uint8)
-                for j, mask in enumerate(masks):
-                    mask_overlay += ((mask > 0) * (j + 1)).astype(np.uint8)
+                    for j in range(masks.shape[0]):
+                        mask_id = k + j + 1
+                        single_mask = (masks[j] > 0).astype(np.uint8) * 255
+                        cleaned_single = self._clean_mask(single_mask)
+                        mask_overlay[cleaned_single > 0] = mask_id
 
-            cleaned_mask = self._clean_mask(mask_overlay)
+            if mask_overlay.max() > self.MAX_VAL:
+                print(f"Too many objects for type: {self.TARGET_TYPE().dtype.name}")
+                mask_overlay = np.clip(mask_overlay, 0, self.MAX_VAL)
+            encoded_mask = mask_overlay.astype(self.TARGET_TYPE)
 
-            success, encoded_image = cv2.imencode('.png', cleaned_mask.astype(np.uint8))
-            if success:
-                masks_list.append(encoded_image.tobytes())
-            else:
-                # Fallback: empty bytes if encoding fails (should never happen)
-                masks_list.append(b"")
+            success, encoded_image = cv2.imencode('.png', encoded_mask)
+            masks_list.append(encoded_image.tobytes() if success else b"")
 
         batch["mask"] = masks_list
         return batch
@@ -247,7 +267,7 @@ class SegmenterStep:
 
 # COMMAND ----------
 
-text_prompt = "pier"
+text_prompt = "structure"
 
 # COMMAND ----------
 
@@ -267,7 +287,11 @@ source_dir = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/ThamesAOI/"
 
 data = spark.createDataFrame(dbutils.fs.ls(source_dir))\
   .withColumn("image_path", F.expr("substring(path, 6, length(path))"))\
-  .withColumn("text_prompt", F.lit(text_prompt))
+  .withColumn("text_prompt", F.lit(text_prompt))\
+  .where("name like '%.ecw%'")
+  # .limit(1)
+
+display(data)
 
 # COMMAND ----------
 
@@ -294,7 +318,7 @@ ds = ds.map_batches(
 ds = ds.map_batches(
     BBoxPredictorStep,
     concurrency=(1, 1 + max_worker_nodes),
-    batch_size=4 * 5,
+    batch_size=4,
     num_gpus=0.75, # Request 50% of a GPU (~20GB on an A100/40GB)
 )
 
@@ -305,7 +329,7 @@ ds = ds.map_batches(
 ds = ds.map_batches(
     SegmenterStep,
     concurrency=(1, 1 + max_worker_nodes),
-    batch_size=8 * 5,
+    batch_size=8,
     num_gpus=0.2, # Request 40% of a GPU (~16GB on an A100/40GB)
 )
 
