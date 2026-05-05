@@ -1,0 +1,12 @@
+resources:
+  jobs:
+    load_ground_truth:
+      name: load_ground_truth_${bundle.target}
+
+      tasks:
+        - task_key: load_ground_truth
+          notebook_task:
+            notebook_path: ../src/load_ground_truth.py
+          existing_cluster_id: 0501-151131-jp5lcmfz
+
+      max_concurrent_runs: 1

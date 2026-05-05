@@ -1,0 +1,12 @@
+resources:
+  jobs:
+    ray_inference:
+      name: ray_inference_${bundle.target}
+
+      tasks:
+        - task_key: run_ray_inference
+          notebook_task:
+            notebook_path: ../src/ray_inference.py
+          existing_cluster_id: 0501-151131-jp5lcmfz
+
+      max_concurrent_runs: 1
