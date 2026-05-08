@@ -1,4 +1,4 @@
-# Scalable object detection and segmentation on Aerial survey imagery
+# Scalable Object Detection and Segmentation on Aerial Imagery
 
 Wraps `src/ray_inference.py` — a Databricks notebook that runs
 open-vocabulary bounding-box detection (OWLv2 / Grounding DINO / OmDet)
