@@ -1,9 +1,9 @@
-# Ray Inference — Databricks Asset Bundle
+# Scalable object detection and segmentation on Aerial survey imagery
 
 Wraps `src/ray_inference.py` — a Databricks notebook that runs
 open-vocabulary bounding-box detection (OWLv2 / Grounding DINO / OmDet)
-and SAM2 / SAM3 segmentation over GeoTIFF / ECW imagery on a
-Ray-on-Spark cluster — as a deployable bundle for an Azure Databricks
+and SAM2 / SAM3 segmentation over GeoTIFF / ECW orthorectified, georeferenced 
+imagery on a Ray-on-Spark cluster — as a deployable bundle for a Databricks
 workspace (set the workspace host in `databricks.yml`).
 
 The pipeline emits up to three Unity Catalog tables, all keyed by
