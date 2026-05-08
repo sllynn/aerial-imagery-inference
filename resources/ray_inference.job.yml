@@ -3,10 +3,51 @@ resources:
     ray_inference:
       name: ray_inference_${bundle.target}
 
+      # Notebook widgets exposed as job parameters. Keys must match the
+      # widget names declared in src/ray_inference.py exactly. Override at
+      # run time with:
+      #   databricks bundle run ray_inference -t dev -p arm \
+      #     --params text_prompt=pier,RUN_DISSOLVE=false,...
+      parameters:
+        - name: text_prompt
+          default: pier
+        - name: BBOX_MODEL
+          default: owlv2
+        - name: RUN_SEGMENTATION
+          default: "true"
+        - name: SEGMENTER_VERSION
+          default: samgeo2
+        - name: RUN_DISSOLVE
+          default: "true"
+        - name: CATALOG
+          default: stuart
+        - name: SCHEMA
+          default: tce
+        - name: VOLUME
+          default: imagery
+        - name: image_path
+          default: /Volumes/stuart/tce/imagery/NorfolkAOI/Ortho_RGBN_P00116896_20240623_20240623_20cm_res.ecw
+        - name: SRID
+          default: "27700"
+        - name: IOU_MATCH_THRESHOLD
+          default: "0.5"
+
       tasks:
         - task_key: run_ray_inference
           notebook_task:
             notebook_path: ../src/ray_inference.py
+            base_parameters:
+              text_prompt: "{{job.parameters.text_prompt}}"
+              BBOX_MODEL: "{{job.parameters.BBOX_MODEL}}"
+              RUN_SEGMENTATION: "{{job.parameters.RUN_SEGMENTATION}}"
+              SEGMENTER_VERSION: "{{job.parameters.SEGMENTER_VERSION}}"
+              RUN_DISSOLVE: "{{job.parameters.RUN_DISSOLVE}}"
+              CATALOG: "{{job.parameters.CATALOG}}"
+              SCHEMA: "{{job.parameters.SCHEMA}}"
+              VOLUME: "{{job.parameters.VOLUME}}"
+              image_path: "{{job.parameters.image_path}}"
+              SRID: "{{job.parameters.SRID}}"
+              IOU_MATCH_THRESHOLD: "{{job.parameters.IOU_MATCH_THRESHOLD}}"
           existing_cluster_id: 0501-151131-jp5lcmfz
 
       max_concurrent_runs: 1

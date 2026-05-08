@@ -1,4 +1,4 @@
 torch
 torchvision
-transformers
-huggingface-hub
+triton
+flash-attn

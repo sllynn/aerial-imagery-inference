@@ -2,11 +2,16 @@
 # MAGIC %md
 # MAGIC # Load Ground Truth WKT into a Delta Table
 # MAGIC
-# MAGIC Reads a CSV of WKT polygons (one quoted POLYGON per line, no header)
-# MAGIC deployed alongside the bundle at `data/piers.csv` and writes them to a
-# MAGIC Delta table with an EPSG:27700 `geometry` column. The inference notebook
-# MAGIC joins this table against `inference_results_boxes` to compute per-image
-# MAGIC IoU, precision, recall, and F1.
+# MAGIC Reads a CSV of WKT polygons deployed alongside the bundle at
+# MAGIC `data/piers.csv` and writes them to a Delta table with an
+# MAGIC EPSG:27700 `geometry` column. The inference notebook joins this
+# MAGIC table against `inference_results_boxes` to compute per-image IoU,
+# MAGIC precision, recall, and F1.
+# MAGIC
+# MAGIC Expected CSV shape: a header row containing a `WKT` column followed
+# MAGIC by any number of attribute columns (e.g. QGIS's standard
+# MAGIC `WKT,_predicate,SHAPE_Leng,SHAPE_Area`). Only the `WKT` column is
+# MAGIC used; everything else is ignored.
 
 # COMMAND ----------
 
@@ -31,21 +36,28 @@ print(f"Reading ground truth from: {GROUND_TRUTH_FILE}")
 
 # COMMAND ----------
 
+import csv
+
 from pyspark.databricks.sql import functions as DBF
 
 # Workspace files are visible to plain Python on the driver but not to Spark's
 # distributed reader, which would prefix the path with `dbfs:` and fail. So we
 # read the CSV in pure Python here, then hand the parsed rows to Spark.
+# `csv.DictReader` handles the quoted WKT cell (which contains commas) and
+# the auxiliary attribute columns from QGIS exports without us having to
+# strip quotes by hand.
 wkts = []
-with open(GROUND_TRUTH_FILE, "r") as fh:
-    for raw in fh:
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        # Strip the wrapping double quotes the CSV format adds around each WKT.
-        if s.startswith('"') and s.endswith('"'):
-            s = s[1:-1]
-        wkts.append(s)
+with open(GROUND_TRUTH_FILE, "r", newline="") as fh:
+    reader = csv.DictReader(fh)
+    if reader.fieldnames is None or "WKT" not in reader.fieldnames:
+        raise ValueError(
+            f"{GROUND_TRUTH_FILE}: expected a header row containing a "
+            f"`WKT` column; got {reader.fieldnames!r}."
+        )
+    for row in reader:
+        wkt = (row.get("WKT") or "").strip()
+        if wkt:
+            wkts.append(wkt)
 
 print(f"Read {len(wkts)} ground-truth WKT polygons from file.")
 

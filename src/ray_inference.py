@@ -11,13 +11,50 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Install Meta's `sam3` package separately
+# MAGIC
+# MAGIC The PyPI `sam3` (version `0.0.1`) is an unrelated stub. Meta's real
+# MAGIC `sam3` is only published as source at
+# MAGIC `github.com/facebookresearch/sam3`. We install it after the main
+# MAGIC resolution with `--reinstall` (override any stub) and `--no-deps`
+# MAGIC (avoid re-resolving samgeo3's `sam3>=0.1.0.20251211` version pin
+# MAGIC against Meta's actual version).
+
+# COMMAND ----------
+
+# MAGIC %sh
+# MAGIC uv pip install \
+# MAGIC   --reinstall \
+# MAGIC   --no-deps \
+# MAGIC   "sam3 @ git+https://github.com/facebookresearch/sam3.git"
+
+# COMMAND ----------
+
 # MAGIC %restart_python
+
+# COMMAND ----------
+
+# Read all widget values. The widgets themselves are declared in the very
+# last cell of the notebook (after `dbutils.notebook.exit()`), so a "Run All"
+# never re-declares them; they're populated either by a manual run of that
+# bottom cell (interactive) or by the job's `base_parameters` block.
+text_prompt         = dbutils.widgets.get("text_prompt")
+BBOX_MODEL          = dbutils.widgets.get("BBOX_MODEL")
+RUN_SEGMENTATION    = dbutils.widgets.get("RUN_SEGMENTATION").lower() == "true"
+SEGMENTER_VERSION   = dbutils.widgets.get("SEGMENTER_VERSION")
+RUN_DISSOLVE        = dbutils.widgets.get("RUN_DISSOLVE").lower() == "true"
+CATALOG             = dbutils.widgets.get("CATALOG")
+SCHEMA              = dbutils.widgets.get("SCHEMA")
+VOLUME              = dbutils.widgets.get("VOLUME")
+image_path          = dbutils.widgets.get("image_path")
+SRID                = int(dbutils.widgets.get("SRID"))
+IOU_MATCH_THRESHOLD = float(dbutils.widgets.get("IOU_MATCH_THRESHOLD"))
 
 # COMMAND ----------
 
 import os
 
-import cv2
 import numpy as np
 import ray
 import supervision as sv
@@ -31,8 +68,6 @@ import rasterio
 from PIL import Image
 from typing import Dict
 
-from pyspark.sql import functions as F
-from pyspark.databricks.sql import functions as DBF
 
 # COMMAND ----------
 
@@ -178,7 +213,7 @@ class BBoxPredictorStep:
         },
     }
 
-    def __init__(self):
+    def __init__(self, queries: list):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if BBOX_MODEL not in self._MODELS:
             raise ValueError(
@@ -191,25 +226,27 @@ class BBoxPredictorStep:
         self.text_threshold = cfg["text_threshold"]
         self.processor = cfg["processor_cls"].from_pretrained(cfg["id"])
         self.model = cfg["model_cls"].from_pretrained(cfg["id"]).to(self.device)
+        # Detection prompt is a run-wide constant, so the actor closes over
+        # the parsed query list rather than reading it from a per-row column.
+        self.queries = list(queries)
 
         print(f"BBoxPredictorStep initialized: model={self.model_name}, device={self.device}")
 
     def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
-        Processes a batch of images and text prompts to find bounding boxes.
+        Processes a batch of images to find bounding boxes for ``self.queries``.
         - Converts NumPy image arrays to PIL Images.
         - Runs the configured open-vocabulary detector on each slice.
-        - Adds the predicted pixel-space boxes to the batch.
+        - Emits per-image lists of pixel-space boxes, class indices, and
+          confidence scores; the index->label mapping happens in
+          ``BoxGeometryStep``.
         """
+        queries = self.queries
         boxes_list = []
         class_ids_list = []
         confidences_list = []
         for i in range(len(batch["image_path"])):
             rgb_array = batch["rgb_image_array"][i]
-            # `text_prompt` may be comma-separated; all three detectors accept a
-            # list of class queries per image and return boxes from each.
-            text_prompt = batch["text_prompt"][i]
-            queries = [q.strip() for q in text_prompt.split(",") if q.strip()]
             def callback(image_slice: np.ndarray) -> sv.Detections:
                 # The slicer passes a numpy array. Convert to PIL for the transformer processor.
                 # Note: PreProcessorStep already converted to RGB, so we don't need cvtColor here.
@@ -302,15 +339,31 @@ class BBoxPredictorStep:
 # Emits matching WKT POLYGON strings so the customer can compare detections to
 # their BNG ground truth via IoU. Mirrors the logic in the customer's
 # "Bounding Box Coordinate Transformation and IoU" notebook.
+# Reprojects each pixel-space bbox to source-CRS coordinates and emits a
+# matching WKT polygon. Optionally also computes per-image cluster envelopes
+# (`cluster_bbox_wkt`) by buffering each AABB by `BUFFER_METRES` and joining
+# overlapping ones via union-find.
+#
+# The dissolve was previously its own `map_batches` actor, but that forced an
+# Arrow boundary between two pure-Python steps. On DBR's pyarrow + Ray combo,
+# Ray's tensor-extension `ArrowPythonObjectScalar.as_py(maps_as_pydicts=...)`
+# fails on ragged list-of-list columns like `box_world`. Folding the dissolve
+# in here avoids the boundary entirely.
 class BoxGeometryStep:
-    def __init__(self):
-        pass
+    BUFFER_METRES = 10
+
+    def __init__(self, queries: list, run_dissolve: bool = False):
+        # `queries` is the parsed open-vocabulary prompt list shared by
+        # every image in the run; we resolve detector class indices to
+        # human-readable labels here.
+        self.queries = list(queries)
+        self.run_dissolve = run_dissolve
 
     @staticmethod
     def _pixel_to_world(box, affine):
-        # Defensive: Ray's pyarrow serialisation of the per-row affine occasionally
-        # comes back longer than 6 (extension types / nested wrapping). Take the
-        # leading 6 floats which are the GDAL-style (a, b, c, d, e, f).
+        # Ray's pyarrow round-trip occasionally returns more than 6 values for
+        # the per-row affine (tensor-extension wrapping). Take the leading 6
+        # which are the GDAL-style (a, b, c, d, e, f).
         a, b, c, d, e, f = list(affine)[:6]
         x1, y1, x2, y2 = list(box)[:4]
         return [
@@ -329,194 +382,289 @@ class BoxGeometryStep:
             f"POLYGON(({e1} {n2}, {e2} {n2}, {e2} {n1}, {e1} {n1}, {e1} {n2}))"
         )
 
+    @staticmethod
+    def _aabb(box_world):
+        # `box_world` is [easting_topleft, northing_topleft,
+        #                 easting_botright, northing_botright].
+        e_tl, n_tl, e_br, n_br = box_world
+        return (
+            min(e_tl, e_br),
+            min(n_tl, n_br),
+            max(e_tl, e_br),
+            max(n_tl, n_br),
+        )
+
+    def _dissolve(self, world_boxes, affine):
+        """Returns ``(cluster_wkts, cluster_pixels)``: world-space WKT
+        polygons of each cluster envelope, and the same envelopes converted
+        to pixel space using ``affine`` (so Pipeline 2 can consume them
+        directly without redoing the world->pixel inversion)."""
+        if not world_boxes:
+            return [], []
+        extents = [self._aabb(list(b)[:4]) for b in world_boxes]
+        n = len(extents)
+        buf = self.BUFFER_METRES
+
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for a in range(n):
+            ax1, ay1, ax2, ay2 = extents[a]
+            ax1 -= buf; ay1 -= buf; ax2 += buf; ay2 += buf
+            for b in range(a + 1, n):
+                bx1, by1, bx2, by2 = extents[b]
+                bx1 -= buf; by1 -= buf; bx2 += buf; by2 += buf
+                if ax1 <= bx2 and bx1 <= ax2 and ay1 <= by2 and by1 <= ay2:
+                    ra, rb = find(a), find(b)
+                    if ra != rb:
+                        parent[ra] = rb
+
+        groups = {}
+        for k in range(n):
+            groups.setdefault(find(k), []).append(k)
+
+        # Affine for the world->pixel inversion below. `b` and `d` are zero
+        # for axis-aligned (north-up) imagery; `e` is negative, so world
+        # ymax (top) maps to the smaller pixel y and ymin (bottom) maps to
+        # the larger pixel y.
+        aff_a, _, aff_c, _, aff_e, aff_f = list(affine)[:6]
+
+        cluster_wkts = []
+        cluster_pixels = []
+        for indices in groups.values():
+            xs = [v for k in indices for v in (extents[k][0], extents[k][2])]
+            ys = [v for k in indices for v in (extents[k][1], extents[k][3])]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            cluster_wkts.append(
+                f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, "
+                f"{xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
+            )
+            cluster_pixels.append([
+                (xmin - aff_c) / aff_a,
+                (ymax - aff_f) / aff_e,
+                (xmax - aff_c) / aff_a,
+                (ymin - aff_f) / aff_e,
+            ])
+        return cluster_wkts, cluster_pixels
+
     def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        world_list, wkt_list, class_label_list = [], [], []
+        # Pixel-space and cluster bboxes are emitted as 4 flat per-image
+        # `array<double>` columns rather than a single `array<array<double>>`,
+        # because Ray's `materialize()` round-trips columns through Arrow and
+        # the `ArrowPythonObjectScalar.as_py(maps_as_pydicts=...)` path blows
+        # up on nested-list columns. The explode actors zip the 4 columns
+        # back into a single 4-element list per detection.
+        queries = self.queries
+        wkt_list, class_label_list = [], []
+        box_xmin, box_ymin, box_xmax, box_ymax = [], [], [], []
+        cluster_wkt_list = []
+        cluster_xmin, cluster_ymin, cluster_xmax, cluster_ymax = [], [], [], []
         for i in range(len(batch["image_path"])):
             affine = list(batch["transform"][i])
             raw_boxes = batch["boxes"][i]
             raw_class_ids = batch["class_ids"][i]
-            queries = [
-                q.strip() for q in batch["text_prompt"][i].split(",") if q.strip()
-            ]
             if raw_boxes is None or len(raw_boxes) == 0:
-                world_list.append([])
                 wkt_list.append([])
                 class_label_list.append([])
+                box_xmin.append([]); box_ymin.append([])
+                box_xmax.append([]); box_ymax.append([])
+                cluster_wkt_list.append([])
+                cluster_xmin.append([]); cluster_ymin.append([])
+                cluster_xmax.append([]); cluster_ymax.append([])
                 continue
             boxes_iter = [
                 b.tolist() if hasattr(b, "tolist") else list(b) for b in raw_boxes
             ]
             world_boxes = [self._pixel_to_world(b, affine) for b in boxes_iter]
-            world_list.append(world_boxes)
             wkt_list.append([self._world_box_to_wkt(wb) for wb in world_boxes])
-            # Map class indices back to the human-readable query strings.
             class_label_list.append([
                 queries[int(c)] if 0 <= int(c) < len(queries) else "unknown"
                 for c in raw_class_ids
             ])
+            box_xmin.append([float(b[0]) for b in boxes_iter])
+            box_ymin.append([float(b[1]) for b in boxes_iter])
+            box_xmax.append([float(b[2]) for b in boxes_iter])
+            box_ymax.append([float(b[3]) for b in boxes_iter])
 
-        batch["box_world"] = world_list
+            if self.run_dissolve:
+                wkts, pixels = self._dissolve(world_boxes, affine)
+                cluster_wkt_list.append(wkts)
+                cluster_xmin.append([float(p[0]) for p in pixels])
+                cluster_ymin.append([float(p[1]) for p in pixels])
+                cluster_xmax.append([float(p[2]) for p in pixels])
+                cluster_ymax.append([float(p[3]) for p in pixels])
+            else:
+                cluster_wkt_list.append([])
+                cluster_xmin.append([]); cluster_ymin.append([])
+                cluster_xmax.append([]); cluster_ymax.append([])
+
         batch["box_wkt"] = wkt_list
         batch["box_class"] = class_label_list
+        batch["box_pixel_xmin"] = box_xmin
+        batch["box_pixel_ymin"] = box_ymin
+        batch["box_pixel_xmax"] = box_xmax
+        batch["box_pixel_ymax"] = box_ymax
+        if self.run_dissolve:
+            batch["cluster_bbox_wkt"] = cluster_wkt_list
+            batch["cluster_pixel_xmin"] = cluster_xmin
+            batch["cluster_pixel_ymin"] = cluster_ymin
+            batch["cluster_pixel_xmax"] = cluster_xmax
+            batch["cluster_pixel_ymax"] = cluster_ymax
         return batch
 
 # COMMAND ----------
 
-# This class loads the SAM2 model and generates segmentation masks.
-class SegmenterStep:
+# Per-image -> per-detection explode actors. Replace the Spark posexplode +
+# arrays_zip cells that previously sat between Ray write and the final
+# per-detection tables. Running the explode in Ray means Delta tables come
+# out per-detection straight from the pipeline, leaving Spark with only the
+# small WKT->geometry lift.
+#
+# `map_batches` allows the output batch to have a different row count from
+# the input, which is what makes the explode possible inside Ray.
 
-    SAM_MODEL = "sam2-hiera-small"
-    WORKING_TYPE = np.uint32
-    TARGET_TYPE = np.uint16
-    MAX_VAL = np.iinfo(TARGET_TYPE).max
-    SUB_BATCH_SIZE = 50
-    KERNEL_SIZE = 5
+def _opt(batch, key, i):
+    """Defensive lookup: returns ``[]`` if ``batch[key][i]`` is missing or
+    ``None``. Used by the explode actors which can run on batches whose
+    upstream produced empty/zero-detection rows."""
+    if key not in batch:
+        return []
+    val = batch[key][i]
+    return [] if val is None else val
 
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.sam = SamGeo2(model_id=self.SAM_MODEL, device=self.device, automatic=False)
-        print("SegmenterStep initialized on device:", self.device)
 
-    def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
-        """
-        Applies morphological operations to improve mask quality.
-        1. Closing: Fills small holes and bridges gaps (fixes fragmentation).
-        2. Opening: Removes small speckles/noise (fixes false positives).
-        """
-        kernel = np.ones((self.KERNEL_SIZE, self.KERNEL_SIZE), np.uint8)
-        
-        cleaned = mask
-        # cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-        # cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-        
-        return cleaned
+class ExplodeBoxesStep:
+    """Per-image rows -> one row per bounding box. Emits both the world-space
+    `box_wkt` and the pixel-space `box_pixel` so Pipeline 2 can prompt SAM
+    directly without redoing the world->pixel inversion. The pixel coords
+    are zipped from 4 flat per-image arrays to dodge the pyarrow nested-list
+    serialisation bug at the materialize() boundary."""
 
-    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """
-        Processes a batch to generate segmentation masks.
-        - Uses the image and bounding boxes from the batch.
-        - Generates a final mask overlay.
-        - Adds the final mask to the batch.
-        """
-        masks_list = []
-        for i in range(len(batch["image_path"])):
-            rgb_array = batch["rgb_image_array"][i]
-            original_np = batch["original_image_np"][i]
-            raw_boxes = batch["boxes"][i]
-            if raw_boxes is None or len(raw_boxes) == 0:
-                boxes_np = np.empty((0, 4), dtype=np.float32)
-            else:
-                if isinstance(raw_boxes, (list, tuple, np.ndarray)):
-                    processed_boxes = [
-                        b.tolist() if hasattr(b, "tolist") else b 
-                        for b in raw_boxes
-                    ]
-                    boxes_np = np.array(processed_boxes, dtype=np.float32)
-                else:
-                    boxes_np = np.atleast_2d(np.array(raw_boxes, dtype=np.float32))
-            boxes_np = np.atleast_2d(boxes_np)
-            num_boxes = boxes_np.shape[0]
-            
-            mask_overlay = np.zeros(original_np.shape[:2], dtype=self.WORKING_TYPE)
-
-            if num_boxes > 0:
-                image_pil = Image.fromarray(rgb_array)
-                self.sam.set_image(image_pil)
-
-                for k in range(0, num_boxes, self.SUB_BATCH_SIZE):
-                    sub_boxes = boxes_np[k:k+self.SUB_BATCH_SIZE]
-                    masks, _, _ = self.sam.predict(
-                        boxes=sub_boxes,
-                        multimask_output=False,
-                        return_results=True
-                        )
-                
-                    if masks.ndim == 4 and masks.shape[1] == 1:
-                        masks = masks.squeeze(1)
-
-                    for j in range(masks.shape[0]):
-                        mask_id = k + j + 1
-                        single_mask = (masks[j] > 0).astype(np.uint8) * 255
-                        cleaned_single = self._clean_mask(single_mask)
-                        mask_overlay[cleaned_single > 0] = mask_id
-
-            if mask_overlay.max() > self.MAX_VAL:
-                print(f"Too many objects for type: {self.TARGET_TYPE().dtype.name}")
-                mask_overlay = np.clip(mask_overlay, 0, self.MAX_VAL)
-            encoded_mask = mask_overlay.astype(self.TARGET_TYPE)
-
-            success, encoded_image = cv2.imencode('.png', encoded_mask)
-            masks_list.append(encoded_image.tobytes() if success else b"")
-
-        batch["mask"] = masks_list
-        return batch
-
-# COMMAND ----------
-
-# This class converts each image's PNG-encoded segmentation mask into a list
-# of CRS-space WKT polygons -- one per distinct mask object, transformed from
-# pixel space using the per-image affine. Mirrors the customer's pandas UDF.
-class MaskPolygonizeStep:
     def __init__(self):
         pass
 
-    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        from rasterio.features import shapes as rio_shapes
-        from rasterio.transform import Affine
-        from shapely.geometry import shape as shapely_shape
-
-        wkts_per_image = []
+    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, list]:
+        out = {
+            "image_path": [],
+            "crs": [],
+            "transform": [],
+            "box_idx": [],
+            "box_wkt": [],
+            "box_pixel": [],
+            "box_class": [],
+            "box_confidence": [],
+        }
         for i in range(len(batch["image_path"])):
-            mask_bytes = batch["mask"][i]
-            polys = []
-
-            if mask_bytes:
-                nparr = np.frombuffer(mask_bytes, np.uint8)
-                decoded = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
-                if decoded is not None:
-                    object_ids = np.unique(decoded[decoded > 0])
-                    if len(object_ids) > 0:
-                        affine = Affine(*list(batch["transform"][i])[:6])
-                        for obj_id in object_ids:
-                            single_obj = (decoded == obj_id).astype(np.uint8)
-                            for geom, val in rio_shapes(single_obj, transform=affine):
-                                if val == 1:
-                                    polys.append(shapely_shape(geom).wkt)
-
-            wkts_per_image.append(polys)
-
-        batch["mask_wkt"] = wkts_per_image
-        return batch
+            wkts = _opt(batch, "box_wkt", i)
+            xmins = _opt(batch, "box_pixel_xmin", i)
+            ymins = _opt(batch, "box_pixel_ymin", i)
+            xmaxs = _opt(batch, "box_pixel_xmax", i)
+            ymaxs = _opt(batch, "box_pixel_ymax", i)
+            classes = _opt(batch, "box_class", i)
+            confs = _opt(batch, "box_confidence", i)
+            for k in range(len(wkts)):
+                out["image_path"].append(batch["image_path"][i])
+                out["crs"].append(batch["crs"][i])
+                out["transform"].append(list(batch["transform"][i]))
+                out["box_idx"].append(k)
+                out["box_wkt"].append(wkts[k])
+                out["box_pixel"].append([
+                    float(xmins[k]), float(ymins[k]),
+                    float(xmaxs[k]), float(ymaxs[k]),
+                ])
+                out["box_class"].append(classes[k])
+                out["box_confidence"].append(float(confs[k]))
+        return out
 
 # COMMAND ----------
 
-# Merged segmentation + polygonisation step.
+class ExplodeClustersStep:
+    """Per-image rows -> one row per cluster envelope. Emits both the
+    world-space `cluster_bbox_wkt` and the pixel-space `cluster_pixel`
+    pre-computed by `BoxGeometryStep`. Same flat-array trick as the boxes
+    explode."""
+
+    def __init__(self):
+        pass
+
+    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, list]:
+        out = {
+            "image_path": [],
+            "cluster_id": [],
+            "cluster_bbox_wkt": [],
+            "cluster_pixel": [],
+        }
+        for i in range(len(batch["image_path"])):
+            wkts = _opt(batch, "cluster_bbox_wkt", i)
+            xmins = _opt(batch, "cluster_pixel_xmin", i)
+            ymins = _opt(batch, "cluster_pixel_ymin", i)
+            xmaxs = _opt(batch, "cluster_pixel_xmax", i)
+            ymaxs = _opt(batch, "cluster_pixel_ymax", i)
+            for k in range(len(wkts)):
+                out["image_path"].append(batch["image_path"][i])
+                out["cluster_id"].append(k)
+                out["cluster_bbox_wkt"].append(wkts[k])
+                out["cluster_pixel"].append([
+                    float(xmins[k]), float(ymins[k]),
+                    float(xmaxs[k]), float(ymaxs[k]),
+                ])
+        return out
+
+# COMMAND ----------
+
+class ExplodeSegmentsStep:
+    """Per-image rows -> one row per segmentation polygon."""
+
+    def __init__(self):
+        pass
+
+    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, list]:
+        out = {
+            "image_path": [],
+            "crs": [],
+            "transform": [],
+            "seg_idx": [],
+            "seg_wkt": [],
+        }
+        for i in range(len(batch["image_path"])):
+            wkts = batch["mask_wkt"][i] if batch["mask_wkt"][i] is not None else []
+            for k in range(len(wkts)):
+                out["image_path"].append(batch["image_path"][i])
+                out["crs"].append(batch["crs"][i])
+                out["transform"].append(list(batch["transform"][i]))
+                out["seg_idx"].append(k)
+                out["seg_wkt"].append(wkts[k])
+        return out
+
+# COMMAND ----------
+
+# Common scaffolding for the segmentation+polygonisation actors. Subclasses
+# load a specific SAM backend in `__init__` and implement `_predict_masks`,
+# which returns an `(N, H, W)` boolean/integer mask array for a batch of
+# pixel-space box prompts.
 #
-# Why merge: Ray Data fails to pass a `mask` (bytes) column between two
-# successive `map_batches` actors -- pyarrow's ArrowPythonObjectScalar.as_py()
-# does not accept the `maps_as_pydicts` kwarg Ray's newer code passes during
-# the to_numpy conversion. By doing both SAM2 inference AND polygonisation in
-# the same `__call__`, the encoded mask never leaves Python and Ray never
-# tries to round-trip it through Arrow.
-class SegmentAndPolygonizeStep:
-    SAM_MODEL = "sam2-hiera-small"
+# The merged `__call__` does both inference and polygonisation in the same
+# Ray actor: pyarrow's `ArrowPythonObjectScalar.as_py(maps_as_pydicts=...)`
+# blows up when image-shaped numpy arrays cross a `map_batches` boundary,
+# so the encoded mask never leaves Python.
+class _BaseSegmentAndPolygonizeStep:
     WORKING_TYPE = np.uint32
     TARGET_TYPE = np.uint16
     MAX_VAL = np.iinfo(TARGET_TYPE).max
     SUB_BATCH_SIZE = 50
 
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.sam = SamGeo2(model_id=self.SAM_MODEL, device=self.device, automatic=False)
-        print("SegmentAndPolygonizeStep initialized on device:", self.device)
+    def _predict_masks(self, image_pil, boxes_np, hw):
+        raise NotImplementedError
 
     def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         from rasterio.features import shapes as rio_shapes
         from rasterio.transform import Affine
         from shapely.geometry import shape as shapely_shape
 
-        masks_list = []
         wkts_list = []
         for i in range(len(batch["image_path"])):
             rgb_array = batch["rgb_image_array"][i]
@@ -524,7 +672,6 @@ class SegmentAndPolygonizeStep:
             raw_boxes = batch["boxes"][i]
             transform = list(batch["transform"][i])[:6]
 
-            # Coerce boxes -> (N, 4) float32
             if raw_boxes is None or len(raw_boxes) == 0:
                 boxes_np = np.empty((0, 4), dtype=np.float32)
             else:
@@ -533,38 +680,18 @@ class SegmentAndPolygonizeStep:
                 ]
                 boxes_np = np.array(processed_boxes, dtype=np.float32)
             boxes_np = np.atleast_2d(boxes_np)
-            num_boxes = boxes_np.shape[0]
 
             mask_overlay = np.zeros(original_np.shape[:2], dtype=self.WORKING_TYPE)
-            if num_boxes > 0:
+            if boxes_np.shape[0] > 0:
                 image_pil = Image.fromarray(rgb_array)
-                self.sam.set_image(image_pil)
-                for k in range(0, num_boxes, self.SUB_BATCH_SIZE):
-                    # samgeo2.predict only forwards `boxes` to SAM2 if it's a
-                    # Python list -- numpy arrays are silently treated as None.
-                    # Converting via .tolist() ensures the prompt actually lands.
-                    sub_boxes = boxes_np[k:k + self.SUB_BATCH_SIZE].tolist()
-                    masks, _, _ = self.sam.predict(
-                        boxes=sub_boxes,
-                        multimask_output=False,
-                        return_results=True,
-                    )
-                    if masks.ndim == 4 and masks.shape[1] == 1:
-                        masks = masks.squeeze(1)
-                    for j in range(masks.shape[0]):
-                        mask_id = k + j + 1
-                        single_mask = (masks[j] > 0).astype(np.uint8)
-                        mask_overlay[single_mask > 0] = mask_id
+                masks = self._predict_masks(image_pil, boxes_np, original_np.shape[:2])
+                for j in range(masks.shape[0]):
+                    mask_overlay[masks[j] > 0] = j + 1
 
             if mask_overlay.max() > self.MAX_VAL:
                 mask_overlay = np.clip(mask_overlay, 0, self.MAX_VAL)
             encoded_mask = mask_overlay.astype(self.TARGET_TYPE)
 
-            # PNG-encode for storage / visualisation.
-            success, encoded_image = cv2.imencode('.png', encoded_mask)
-            masks_list.append(encoded_image.tobytes() if success else b"")
-
-            # Polygonise directly from the uint16 mask -- no PNG round-trip.
             polys = []
             object_ids = np.unique(encoded_mask[encoded_mask > 0])
             if len(object_ids) > 0:
@@ -576,69 +703,105 @@ class SegmentAndPolygonizeStep:
                             polys.append(shapely_shape(geom).wkt)
             wkts_list.append(polys)
 
-        batch["mask"] = masks_list
         batch["mask_wkt"] = wkts_list
         return batch
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Set `text_prompt`to whatever you want to detect
+class SegmentAndPolygonizeStep(_BaseSegmentAndPolygonizeStep):
+    """SAM2 backend (`samgeo.samgeo2.SamGeo2` with `sam2-hiera-small`)."""
+
+    SAM_MODEL = "sam2-hiera-small"
+
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sam = SamGeo2(model_id=self.SAM_MODEL, device=self.device, automatic=False)
+        print("SegmentAndPolygonizeStep initialized on device:", self.device)
+
+    def _predict_masks(self, image_pil, boxes_np, hw):
+        self.sam.set_image(image_pil)
+        chunks = []
+        for k in range(0, boxes_np.shape[0], self.SUB_BATCH_SIZE):
+            # samgeo2.predict only forwards `boxes` to SAM2 if it's a Python
+            # list -- numpy arrays are silently treated as None. `.tolist()`
+            # ensures the prompt actually lands.
+            sub_boxes = boxes_np[k:k + self.SUB_BATCH_SIZE].tolist()
+            masks, _, _ = self.sam.predict(
+                boxes=sub_boxes,
+                multimask_output=False,
+                return_results=True,
+            )
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks.squeeze(1)
+            chunks.append(masks)
+        return np.concatenate(chunks, axis=0)
 
 # COMMAND ----------
 
-text_prompt = "pier"
+class SegmentAndPolygonizeStepSAM3(_BaseSegmentAndPolygonizeStep):
+    """SAM3 backend (`samgeo.samgeo3.SamGeo3` with the meta backend in
+    interactive mode). Selected by `SEGMENTER_VERSION = "samgeo3"`."""
+
+    def __init__(self):
+        from samgeo.samgeo3 import SamGeo3
+        import os
+        import sam3
+
+        # samgeo3 defaults to looking in `samgeo/assets/` for the BPE vocab,
+        # but the file is shipped with the `sam3` package itself at
+        # `sam3/assets/bpe_simple_vocab_16e6.txt.gz`. Resolve sam3's install
+        # location and point samgeo3 there.
+        bpe_path = os.path.join(
+            os.path.dirname(sam3.__file__),
+            "assets",
+            "bpe_simple_vocab_16e6.txt.gz",
+        )
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sam = SamGeo3(
+            backend="meta",
+            device=self.device,
+            enable_inst_interactivity=True,
+            bpe_path=bpe_path,
+        )
+        print(f"SegmentAndPolygonizeStepSAM3 initialized on device: {self.device}")
+
+    def _predict_masks(self, image_pil, boxes_np, hw):
+        H, W = hw
+        chunks = []
+        # SAM3 expects bfloat16 inputs while keeping some Linear weights in
+        # float32, raising "mat1 and mat2 must have the same dtype" without
+        # the autocast wrapper. See facebookresearch/sam3#507.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            self.sam.set_image(image_pil)
+            for k in range(0, boxes_np.shape[0], self.SUB_BATCH_SIZE):
+                sub_boxes = boxes_np[k:k + self.SUB_BATCH_SIZE].tolist()
+                # `generate_masks_by_boxes_inst` returns None; masks land on
+                # `self.sam.masks`. Default `box_crs=None` means pixel coords.
+                self.sam.generate_masks_by_boxes_inst(sub_boxes)
+                masks = self.sam.masks
+                # bfloat16 -> float32 -> numpy (numpy can't read bf16).
+                if hasattr(masks, "detach"):
+                    masks = masks.detach().float().cpu().numpy()
+                masks = np.asarray(masks)
+                if masks.ndim == 4 and masks.shape[1] == 1:
+                    masks = masks.squeeze(1)
+                if masks.ndim == 2:
+                    masks = masks[None, ...]
+                assert masks.ndim == 3 and masks.shape[-2:] == (H, W), (
+                    f"Unexpected SAM3 masks shape {masks.shape}; "
+                    f"expected (..., {H}, {W})."
+                )
+                chunks.append(masks)
+        return np.concatenate(chunks, axis=0)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Pick the bounding-box detector
-# MAGIC
-# MAGIC Three open-vocabulary detectors are wired in:
-# MAGIC
-# MAGIC - `"owlv2"` -- `google/owlv2-large-patch14-ensemble`. Best stock results
-# MAGIC   on this aerial AOI; tends to miss thin elongated piers.
-# MAGIC - `"grounding_dino"` -- `IDEA-Research/grounding-dino-base`. Broader text
-# MAGIC   matching; needs higher thresholds and is prone to false positives on
-# MAGIC   industrial buildings in top-down views.
-# MAGIC - `"omdet"` -- `omlab/omdet-turbo-swin-tiny-hf`. Fastest; weakest recall
-# MAGIC   on this dataset.
+# Detection prompt is a run-wide constant -- the actor closes over it
+# instead of carrying it as a per-row column.
+queries = [q.strip() for q in text_prompt.split(",") if q.strip()]
 
-# COMMAND ----------
-
-BBOX_MODEL = "owlv2"  # one of: "owlv2", "grounding_dino", "omdet"
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Disable segmentation when only bounding boxes are needed
-# MAGIC
-# MAGIC Set `RUN_SEGMENTATION = False` to skip the SAM2 stage during precision/recall
-# MAGIC evaluation. The pipeline still emits pixel boxes, world-space boxes and WKT
-# MAGIC polygons so the customer can compute IoU against ground truth.
-
-# COMMAND ----------
-
-RUN_SEGMENTATION = True
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Set `source_dir` to the path of your Volume that stores your list of .tifs
-
-# COMMAND ----------
-
-CATALOG = "stuart"
-SCHEMA = "tce"
-VOLUME = "imagery"
-
-# COMMAND ----------
-
-image_path = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/ThamesAOI/Ortho_RGBN_P00084612_20090823_20090823_20cm_resTQ57nw.ecw"
-
-data = spark.createDataFrame([(image_path,)], ["image_path"])\
-  .withColumn("text_prompt", F.lit(text_prompt))
-
+data = spark.createDataFrame([(image_path,)], ["image_path"])
 display(data)
 
 # COMMAND ----------
@@ -665,6 +828,7 @@ ds = ds.map_batches(
 # across the cluster, one on each GPU, leaving room for the next step.
 ds = ds.map_batches(
     BBoxPredictorStep,
+    fn_constructor_kwargs={"queries": queries},
     concurrency=(1, 1 + max_worker_nodes),
     batch_size=4,
     num_gpus=0.75, # Request 50% of a GPU (~20GB on an A100/40GB)
@@ -672,23 +836,32 @@ ds = ds.map_batches(
 
 # Step 3: BoxGeometryStep (CPU-only, lightweight)
 # Reproject pixel boxes to source-CRS coordinates using the per-image affine
-# and emit WKT polygons for downstream IoU evaluation.
+# and emit WKT polygons for downstream IoU evaluation. When `RUN_DISSOLVE` is
+# on, this same actor also computes per-image cluster envelopes
+# (`cluster_bbox_wkt`) -- folded into one map_batches to avoid the Arrow
+# boundary that breaks Ray's tensor-extension scalar conversion on this
+# pyarrow.
 ds = ds.map_batches(
     BoxGeometryStep,
+    fn_constructor_kwargs={"queries": queries, "run_dissolve": RUN_DISSOLVE},
     concurrency=(1, 3 * (1 + max_worker_nodes)),
     batch_size=8,
     num_cpus=1,
 )
 
-# Segmentation does NOT run inside this Ray pipeline -- it is split into a
-# second Ray pipeline (further down) that consumes the dissolved cluster
-# bboxes from Spark, so SAM2 sees clean inputs rather than the noisy raw
-# detections.
+# Segmentation runs as a separate Ray pipeline further down, sourced from
+# whichever per-detection table Pipeline 1 produced (clusters_table when
+# RUN_DISSOLVE=true, boxes_table when false).
 
-# `boxes` and `box_world` are list-of-lists per row; Ray serialises them as
-# opaque BINARY in Delta which breaks downstream `arrays_zip`. WKT is enough
-# for IoU evaluation, so drop the numeric forms before write.
-ds = ds.drop_columns(["rgb_image_array", "original_image_np", "boxes", "box_world", "class_ids"])
+# `boxes` is a per-image list-of-4-tuples (array<array<double>>) which Ray
+# can't safely round-trip across the materialize() boundary -- pyarrow's
+# `ArrowPythonObjectScalar.as_py(maps_as_pydicts=...)` blows up on nested
+# lists. BoxGeometryStep already derived the per-image flat
+# `box_pixel_xmin/ymin/xmax/ymax` arrays from `boxes`, so we drop the
+# nested column here.
+ds = ds.drop_columns([
+    "rgb_image_array", "original_image_np", "boxes", "class_ids",
+])
 
 # COMMAND ----------
 
@@ -711,118 +884,83 @@ os.environ["RAY_UC_VOLUMES_FUSE_TEMP_DIR"] = temp_dir
 table_name = "inference_results"
 tref = f"{CATALOG}.{SCHEMA}.{table_name}"
 
-spark.sql(f"DROP TABLE IF EXISTS {tref}")
+boxes_table = f"{tref}_boxes"
+clusters_table = f"{tref}_clusters"
 
-ds.write_databricks_table(tref, mode='overwrite')
-
-# COMMAND ----------
-
-spark.table(tref).display()
+# Materialise once so the box-explode and cluster-explode forks below don't
+# each re-run the upstream actors. After this, `ds` is a MaterializedDataset
+# in the object store and either branch reads from it cheaply.
+ds = ds.materialize()
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Per-box geometry table for IoU evaluation
 # MAGIC
-# MAGIC The per-image inference table holds detection arrays per row. Below we
-# MAGIC explode it into one row per detected bounding box and promote the WKT
-# MAGIC polygon to a Databricks `geometry` column in EPSG:27700 (British
-# MAGIC National Grid). The customer joins this against their ground truth and
-# MAGIC computes IoU per box (`st_intersection` / `st_area`) or at image level
-# MAGIC (`st_union_agg`) -- exactly as in their reference notebook.
+# MAGIC `ExplodeBoxesStep` flattens the per-image detection arrays into one
+# MAGIC row per bounding box inside Ray. Spark's only role afterwards is the
+# MAGIC tiny WKT-to-`geometry` lift -- no posexplode, no `arrays_zip`, no
+# MAGIC tensor-extension struct unpacking.
 
 # COMMAND ----------
 
-# Source imagery for this evaluation is supplied in EPSG:27700. Update if the
-# `crs` column in the inference table reports a different CRS.
-SRID = 27700
-boxes_table = f"{tref}_boxes"
-
-per_box = (
-    spark.table(tref)
-        # Ray serialises numeric arrays as STRUCT<data, shape> (its tensor
-        # extension type). Pull `.data` out so it behaves like a plain array.
-        .withColumn("box_confidence", F.col("box_confidence").getField("data"))
-        .select(
-            "image_path",
-            "crs",
-            "transform",
-            F.posexplode(
-                F.arrays_zip(
-                    F.col("box_wkt").alias("box_wkt"),
-                    F.col("box_class").alias("box_class"),
-                    F.col("box_confidence").alias("box_confidence"),
-                )
-            ).alias("box_idx", "_b"),
-        )
-        .select("image_path", "crs", "transform", "box_idx", "_b.*")
-        .withColumn("geometry", DBF.st_geomfromtext("box_wkt", SRID))
+ds_boxes = ds.map_batches(
+    ExplodeBoxesStep,
+    concurrency=(1, 3 * (1 + max_worker_nodes)),
+    batch_size=8,
+    num_cpus=1,
 )
 
+boxes_stage = f"{boxes_table}_wkt"
+spark.sql(f"DROP TABLE IF EXISTS {boxes_stage}")
+ds_boxes.write_databricks_table(boxes_stage, mode='overwrite')
+
+# Single Spark transform: lift `box_wkt` to a Databricks `geometry` column.
 spark.sql(f"DROP TABLE IF EXISTS {boxes_table}")
-per_box.write.mode("overwrite").saveAsTable(boxes_table)
+spark.sql(f"""
+    CREATE TABLE {boxes_table} AS
+    SELECT *, st_geomfromtext(box_wkt, {SRID}) AS geometry
+    FROM {boxes_stage}
+""")
+spark.sql(f"DROP TABLE {boxes_stage}")
 display(spark.table(boxes_table))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Dissolve overlapping detections into clusters
+# MAGIC ## Per-cluster geometry table
 # MAGIC
-# MAGIC Treats the detection set as a graph (node = box, edge = "intersects")
-# MAGIC and replaces each connected component with the union polygon and its
-# MAGIC envelope. The envelope is what `SegmenterStep` would consume as a SAM2
-# MAGIC box prompt; the polygon is kept for visualisation and any future
-# MAGIC polygon-vs-polygon comparison against ground truth.
-# MAGIC
-# MAGIC Each cluster also carries `n_boxes`, `mean_confidence`, and
-# MAGIC `max_confidence` from the original detections that fell inside it.
+# MAGIC Skipped when `RUN_DISSOLVE = False`. `ExplodeClustersStep` flattens
+# MAGIC the per-image `cluster_bbox_wkt` arrays into one row per cluster
+# MAGIC inside Ray; Spark only adds the `cluster_bbox` geometry column.
 
 # COMMAND ----------
 
-clusters_table = f"{tref}_clusters"
-
-CLUSTER_BUFFER_METRES = 10
-
-clusters = spark.sql(f"""
-    WITH dissolved AS (
-        -- Buffer each detection by {CLUSTER_BUFFER_METRES}m before unioning so
-        -- nearby-but-not-touching detections fall into the same cluster. Group
-        -- by image_path so each cluster carries the image it came from --
-        -- needed by the downstream segmentation pipeline.
-        SELECT image_path,
-               st_union_agg(st_buffer(geometry, {CLUSTER_BUFFER_METRES})) AS multi
-        FROM {boxes_table}
-        GROUP BY image_path
-    ),
-    components AS (
-        SELECT d.image_path,
-               t.cluster_id,
-               st_geometryn(d.multi, t.cluster_id + 1) AS cluster_geom
-        FROM dissolved d
-        LATERAL VIEW explode(sequence(0, CAST(st_numgeometries(d.multi) AS INT) - 1)) t AS cluster_id
+if RUN_DISSOLVE:
+    ds_clusters = ds.map_batches(
+        ExplodeClustersStep,
+        concurrency=(1, 3 * (1 + max_worker_nodes)),
+        batch_size=8,
+        num_cpus=1,
     )
-    -- GEOMETRY columns are not orderable, so we GROUP BY (image_path,
-    -- cluster_id) only and pull the (single) cluster_geom through with
-    -- `any_value`.
-    SELECT
-        c.image_path,
-        c.cluster_id,
-        any_value(c.cluster_geom) AS cluster_geom,
-        st_envelope(any_value(c.cluster_geom)) AS cluster_bbox,
-        count(b.box_confidence) AS n_boxes,
-        avg(b.box_confidence) AS mean_confidence,
-        max(b.box_confidence) AS max_confidence
-    FROM components c
-    LEFT JOIN {boxes_table} b
-        ON c.image_path = b.image_path
-        AND st_intersects(c.cluster_geom, b.geometry)
-    GROUP BY c.image_path, c.cluster_id
-    ORDER BY c.image_path, c.cluster_id
-""")
 
-spark.sql(f"DROP TABLE IF EXISTS {clusters_table}")
-clusters.write.mode("overwrite").saveAsTable(clusters_table)
-display(spark.table(clusters_table))
+    clusters_stage = f"{clusters_table}_wkt"
+    spark.sql(f"DROP TABLE IF EXISTS {clusters_stage}")
+    ds_clusters.write_databricks_table(clusters_stage, mode='overwrite')
+
+    spark.sql(f"DROP TABLE IF EXISTS {clusters_table}")
+    spark.sql(f"""
+        CREATE TABLE {clusters_table} AS
+        SELECT *, st_geomfromtext(cluster_bbox_wkt, {SRID}) AS cluster_bbox
+        FROM {clusters_stage}
+    """)
+    spark.sql(f"DROP TABLE {clusters_stage}")
+    display(spark.table(clusters_table))
+else:
+    print(
+        f"RUN_DISSOLVE=False -- skipping cluster table. Pipeline 2 and the "
+        f"evaluation will use raw per-box geometries from {boxes_table}."
+    )
 
 # COMMAND ----------
 
@@ -831,11 +969,22 @@ display(spark.table(clusters_table))
 # MAGIC
 # MAGIC The dissolved `cluster_bbox` envelopes are clean inputs for SAM2 -- one
 # MAGIC bbox per physical pier rather than the original swarm of overlapping
-# MAGIC detections. This pipeline re-loads each image, converts the world-space
-# MAGIC cluster envelopes to pixel coordinates via the per-image affine, runs
-# MAGIC SAM2, and polygonises the resulting masks back to world-space WKT.
+# MAGIC detections. Pipeline 1 already persisted each detection's pixel-space
+# MAGIC bbox (`box_pixel` / `cluster_pixel`), so this pipeline just re-loads
+# MAGIC the image, hands the pixel boxes to SAM, and polygonises the masks
+# MAGIC back to world-space WKT.
 # MAGIC
 # MAGIC Skipped entirely when `RUN_SEGMENTATION = False`.
+
+# COMMAND ----------
+
+if RUN_SEGMENTATION and SEGMENTER_VERSION == "samgeo3":
+    # SAM3's weights are gated on Hugging Face. Set HF_TOKEN here so it
+    # propagates to every Ray actor for model download. Stored in the
+    # `stuart` Databricks secret scope under key `hf_token`.
+    import os
+    os.environ["HF_TOKEN"] = dbutils.secrets.get(scope="stuart", key="hf_token")
+    print("HF_TOKEN set from Databricks secret stuart/hf_token.")
 
 # COMMAND ----------
 
@@ -844,24 +993,33 @@ if RUN_SEGMENTATION:
     # bbox coord as its own flat array<double> column rather than a nested
     # array<array<double>>, because Ray's from_spark trips over the latter
     # (pyarrow ArrowPythonObjectScalar incompatibility with `maps_as_pydicts`).
+    #
+    # Source table flips with `RUN_DISSOLVE`: cluster envelopes when on,
+    # raw per-detection geometries when off. Both tables now carry a
+    # pixel-space bbox column (`box_pixel` / `cluster_pixel`) pre-computed
+    # in Pipeline 1, so no world->pixel inversion is needed here.
+    _bbox_source = clusters_table if RUN_DISSOLVE else boxes_table
+    _bbox_pixel_col = "cluster_pixel" if RUN_DISSOLVE else "box_pixel"
     seg_input_df = spark.sql(f"""
         SELECT
             image_path,
-            collect_list(st_xmin(cluster_bbox)) AS xmins,
-            collect_list(st_ymin(cluster_bbox)) AS ymins,
-            collect_list(st_xmax(cluster_bbox)) AS xmaxs,
-            collect_list(st_ymax(cluster_bbox)) AS ymaxs
-        FROM {clusters_table}
+            collect_list({_bbox_pixel_col}[0]) AS xmins,
+            collect_list({_bbox_pixel_col}[1]) AS ymins,
+            collect_list({_bbox_pixel_col}[2]) AS xmaxs,
+            collect_list({_bbox_pixel_col}[3]) AS ymaxs
+        FROM {_bbox_source}
         GROUP BY image_path
     """)
     display(seg_input_df)
 
 # COMMAND ----------
 
-# Converts world-space cluster envelopes to pixel-space [x1, y1, x2, y2]
-# using each row's affine transform, and writes them to `batch["boxes"]` so
-# SegmenterStep can consume them as SAM2 prompts.
-class WorldToPixelBoxesStep:
+# Zips the per-image pixel-space xmins/ymins/xmaxs/ymaxs columns (already
+# pre-computed by Pipeline 1 and carried through `seg_input_df` as four
+# flat array<double> columns) into the `batch["boxes"]` list-of-4-tuples
+# format the segmentation actors expect. No coordinate transforms here:
+# the world->pixel inversion lives once, in `BoxGeometryStep`.
+class PixelBoxAssemblerStep:
     def __init__(self):
         pass
 
@@ -872,35 +1030,9 @@ class WorldToPixelBoxesStep:
             ymins = list(batch["ymins"][i])
             xmaxs = list(batch["xmaxs"][i])
             ymaxs = list(batch["ymaxs"][i])
-            a, _b, c, _d, e, f = list(batch["transform"][i])[:6]
-            pixel_boxes = []
-            for w_xmin, w_ymin, w_xmax, w_ymax in zip(xmins, ymins, xmaxs, ymaxs):
-                # Inverse of an axis-aligned (north-up) affine. b == d == 0.
-                p_xmin = (w_xmin - c) / a
-                p_xmax = (w_xmax - c) / a
-                # e is negative for north-up imagery, so the world's ymax (top)
-                # maps to the smaller pixel y, and ymin (bottom) to the larger.
-                p_y_top    = (w_ymax - f) / e
-                p_y_bottom = (w_ymin - f) / e
-                pixel_boxes.append([p_xmin, p_y_top, p_xmax, p_y_bottom])
-            boxes_per_image.append(pixel_boxes)
-
-            # One-shot diagnostic on the first row -- prints the affine, image
-            # shape, and the world->pixel translation of the first three boxes,
-            # so we can verify the bboxes truly land on the river piers in
-            # pixel space.
-            if i == 0:
-                img_shape = batch["original_image_np"][i].shape
-                print(f"[WorldToPixel] image_path = {batch['image_path'][i]}")
-                print(f"[WorldToPixel] image shape (H, W, B) = {img_shape}")
-                print(f"[WorldToPixel] affine (a, b, c, d, e, f) = "
-                      f"({a}, {_b}, {c}, {_d}, {e}, {f})")
-                print(f"[WorldToPixel] first {min(3, len(xmins))} world bboxes -> pixel:")
-                for k in range(min(3, len(xmins))):
-                    print(f"    world  [{xmins[k]:.1f}, {ymins[k]:.1f}, "
-                          f"{xmaxs[k]:.1f}, {ymaxs[k]:.1f}]")
-                    print(f"    pixel  [{pixel_boxes[k][0]:.1f}, {pixel_boxes[k][1]:.1f}, "
-                          f"{pixel_boxes[k][2]:.1f}, {pixel_boxes[k][3]:.1f}]")
+            boxes_per_image.append(
+                [list(b) for b in zip(xmins, ymins, xmaxs, ymaxs)]
+            )
 
         batch["boxes"] = boxes_per_image
         return batch
@@ -919,23 +1051,42 @@ if RUN_SEGMENTATION:
         num_cpus=1,
     )
 
-    # Convert cluster_bboxes_world -> pixel-space `boxes` ready for SAM2.
+    # Zip the per-image pixel-space xmins/ymins/xmaxs/ymaxs into the
+    # `batch["boxes"]` list-of-4-tuples format SAM expects. No coordinate
+    # conversion -- pixel boxes were pre-computed in Pipeline 1.
     seg_ds = seg_ds.map_batches(
-        WorldToPixelBoxesStep,
+        PixelBoxAssemblerStep,
         concurrency=(1, 3 * (1 + max_worker_nodes)),
         batch_size=8,
         num_cpus=1,
     )
 
-    # SAM2 segmentation + in-step polygonisation. Merged into a single
-    # map_batches actor so the bytes-typed `mask` column never has to be
-    # passed between Ray actors (pyarrow ArrowPythonObjectScalar can't be
-    # converted via the modern Ray->numpy code path).
+    # Segmentation + in-step polygonisation. Merged into a single map_batches
+    # actor so the bytes-typed `mask` column never has to be passed between
+    # Ray actors. Backend selected by `SEGMENTER_VERSION` near the top of the
+    # notebook -- `samgeo2` (SAM2) or `samgeo3` (SAM3, transformers backend).
+    _seg_step = {
+        "samgeo2": SegmentAndPolygonizeStep,
+        "samgeo3": SegmentAndPolygonizeStepSAM3,
+    }[SEGMENTER_VERSION]
+
+    # samgeo3 downloads gated SAM3 weights from Hugging Face inside the
+    # actor's __init__, and driver-side os.environ doesn't propagate to
+    # actors on other nodes. Forward HF_TOKEN through `runtime_env`, which
+    # `map_batches` accepts via its **ray_remote_args collector and applies
+    # to each actor's process before __init__ runs.
+    _seg_extra = {}
+    if SEGMENTER_VERSION == "samgeo3":
+        _seg_extra = {
+            "runtime_env": {"env_vars": {"HF_TOKEN": os.environ["HF_TOKEN"]}}
+        }
+
     seg_ds = seg_ds.map_batches(
-        SegmentAndPolygonizeStep,
+        _seg_step,
         concurrency=(1, 1 + max_worker_nodes),
         batch_size=8,
         num_gpus=0.4,
+        **_seg_extra,
     )
 
     seg_ds = seg_ds.drop_columns(
@@ -943,41 +1094,40 @@ if RUN_SEGMENTATION:
          "xmins", "ymins", "xmaxs", "ymaxs"]
     )
 
-# COMMAND ----------
-
-if RUN_SEGMENTATION:
-    segmentation_table = f"{tref}_segmentation"
-    spark.sql(f"DROP TABLE IF EXISTS {segmentation_table}")
-    seg_ds.write_databricks_table(segmentation_table, mode="overwrite")
-    display(spark.table(segmentation_table))
+    # Per-image -> per-segment explode in Ray. Same pattern as Pipeline 1:
+    # the per-detection write happens straight from Ray, leaving Spark only
+    # the WKT->geometry lift.
+    seg_ds = seg_ds.map_batches(
+        ExplodeSegmentsStep,
+        concurrency=(1, 3 * (1 + max_worker_nodes)),
+        batch_size=8,
+        num_cpus=1,
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Per-segment geometry table
 # MAGIC
-# MAGIC Explodes the per-image `mask_wkt` array into one row per polygon, with
-# MAGIC an EPSG:27700 `geometry` column ready for IoU evaluation.
+# MAGIC `ExplodeSegmentsStep` flattens the per-image `mask_wkt` arrays in Ray;
+# MAGIC Spark only lifts `seg_wkt` to a Databricks `geometry` column.
 
 # COMMAND ----------
 
 if RUN_SEGMENTATION:
-    segments_table = f"{tref}_segments"
+    segments_table = f"{tref}_segments_{SEGMENTER_VERSION}"
+    segments_stage = f"{segments_table}_wkt"
 
-    per_segment = (
-        spark.table(segmentation_table)
-            .where("size(mask_wkt) > 0")
-            .select(
-                "image_path",
-                "crs",
-                "transform",
-                F.posexplode("mask_wkt").alias("seg_idx", "seg_wkt"),
-            )
-            .withColumn("geometry", DBF.st_geomfromtext("seg_wkt", SRID))
-    )
+    spark.sql(f"DROP TABLE IF EXISTS {segments_stage}")
+    seg_ds.write_databricks_table(segments_stage, mode="overwrite")
 
     spark.sql(f"DROP TABLE IF EXISTS {segments_table}")
-    per_segment.write.mode("overwrite").saveAsTable(segments_table)
+    spark.sql(f"""
+        CREATE TABLE {segments_table} AS
+        SELECT *, st_geomfromtext(seg_wkt, {SRID}) AS geometry
+        FROM {segments_stage}
+    """)
+    spark.sql(f"DROP TABLE {segments_stage}")
     display(spark.table(segments_table))
 
 # COMMAND ----------
@@ -985,49 +1135,73 @@ if RUN_SEGMENTATION:
 # MAGIC %md
 # MAGIC ## Evaluation against ground truth
 # MAGIC
-# MAGIC Compares detections in `inference_results_boxes` to the ground-truth
-# MAGIC polygons in `${CATALOG}.${SCHEMA}.ground_truth` (populated by the
+# MAGIC Compares detection geometries to the ground-truth polygons in
+# MAGIC `${CATALOG}.${SCHEMA}.ground_truth` (populated by the
 # MAGIC `load_ground_truth` notebook).
 # MAGIC
-# MAGIC The detector emits axis-aligned bounding boxes, while ground-truth
-# MAGIC polygons trace each pier's actual shape, so we take the **envelope**
-# MAGIC (minimum bounding rectangle) of each ground-truth polygon before
-# MAGIC computing IoU. This is the apples-to-apples comparison.
+# MAGIC The same evaluator runs after each Ray pipeline:
+# MAGIC
+# MAGIC - **Bounding-box detections** -- the detector emits axis-aligned
+# MAGIC   rectangles, so we take `st_envelope` of each ground-truth polygon
+# MAGIC   first. Apples-to-apples bbox comparison.
+# MAGIC - **Segmentation polygons** -- detection masks already trace the
+# MAGIC   structure's actual shape, so we compare the raw GT polygon directly.
 # MAGIC
 # MAGIC Reports:
 # MAGIC
 # MAGIC - **Image-level IoU** -- the dissolve-and-intersect approach from the
 # MAGIC   customer's reference notebook (single number).
-# MAGIC - **Per-box matching** -- for each detection, the IoU of its best
-# MAGIC   ground-truth match; same for each ground-truth bbox. From those,
+# MAGIC - **Per-detection matching** -- for each detection, the IoU of its
+# MAGIC   best ground-truth match; same for each ground-truth row. From those,
 # MAGIC   precision, recall and F1 are computed at `IOU_MATCH_THRESHOLD`.
 
 # COMMAND ----------
 
 GROUND_TRUTH_TABLE = f"{CATALOG}.{SCHEMA}.ground_truth"
-IOU_MATCH_THRESHOLD = 0.5  # min IoU to count a detection as a true positive
 
 # COMMAND ----------
 
-if not spark.catalog.tableExists(GROUND_TRUTH_TABLE):
-    print(f"Ground truth table {GROUND_TRUTH_TABLE} not found.")
-    print("Run the `load_ground_truth` notebook (in src/) before evaluating.")
-else:
-    # Ground-truth polygons trace the precise pier shape, but the dissolved
-    # cluster bboxes are axis-aligned. Take the envelope of each GT polygon
-    # so the comparison is bbox-to-bbox.
+def evaluate_against_ground_truth(
+    det_table: str,
+    det_id_col: str,
+    det_geom_col: str,
+    *,
+    envelope_gt: bool,
+    label: str,
+    iou_threshold: float = IOU_MATCH_THRESHOLD,
+):
+    """
+    Score detections in ``det_table`` against ``GROUND_TRUTH_TABLE``.
+
+    ``envelope_gt`` should be True for axis-aligned bbox detections (where
+    the ground-truth polygons get reduced to their MBRs first) and False
+    for segmentation polygons (compared directly).
+
+    ``label`` is used in temp-view names and the printed summary header so
+    multiple invocations don't collide.
+    """
+    if not spark.catalog.tableExists(GROUND_TRUTH_TABLE):
+        print(f"Ground truth table {GROUND_TRUTH_TABLE} not found.")
+        print("Run the `load_ground_truth` notebook (in src/) before evaluating.")
+        return None
+
+    safe = label.replace("-", "_").replace(" ", "_").lower()
+    gt_view = f"gt_{safe}"
+    pair_view = f"pair_iou_{safe}"
+    det_match_view = f"det_match_{safe}"
+    gt_match_view = f"gt_match_{safe}"
+
+    gt_geom_expr = "st_envelope(geometry)" if envelope_gt else "geometry"
     spark.sql(f"""
-        CREATE OR REPLACE TEMP VIEW gt_bbox AS
-        SELECT gt_id, st_envelope(geometry) AS geometry
+        CREATE OR REPLACE TEMP VIEW {gt_view} AS
+        SELECT gt_id, {gt_geom_expr} AS geometry
         FROM {GROUND_TRUTH_TABLE}
     """)
 
     # Image-level IoU -- dissolve both sets, then compute IoU of the unions.
-    # Detections side uses the dissolved `cluster_bbox` so duplicates from the
-    # raw per-box table do not double-count.
     image_iou = spark.sql(f"""
-        WITH gt AS (SELECT st_union_agg(geometry) AS geom FROM gt_bbox),
-             pr AS (SELECT st_union_agg(cluster_bbox) AS geom FROM {clusters_table}),
+        WITH gt AS (SELECT st_union_agg(geometry) AS geom FROM {gt_view}),
+             pr AS (SELECT st_union_agg({det_geom_col}) AS geom FROM {det_table}),
              areas AS (
                  SELECT st_area(g.geom) AS area_gt,
                         st_area(p.geom) AS area_pr,
@@ -1043,48 +1217,50 @@ else:
     """)
     display(image_iou)
 
-    # Pairwise IoU across every (cluster, ground-truth-bbox) pair that intersect.
+    # Pairwise IoU across every (detection, ground-truth) pair that intersects.
     spark.sql(f"""
-        CREATE OR REPLACE TEMP VIEW pair_iou AS
+        CREATE OR REPLACE TEMP VIEW {pair_view} AS
         SELECT
             gt.gt_id,
             det.image_path,
-            det.cluster_id,
-            st_area(st_intersection(gt.geometry, det.cluster_bbox)) /
+            det.{det_id_col} AS det_id,
+            st_area(st_intersection(gt.geometry, det.{det_geom_col})) /
                 NULLIF(
-                    st_area(gt.geometry) + st_area(det.cluster_bbox)
-                        - st_area(st_intersection(gt.geometry, det.cluster_bbox)),
+                    st_area(gt.geometry) + st_area(det.{det_geom_col})
+                        - st_area(st_intersection(gt.geometry, det.{det_geom_col})),
                     0
                 ) AS iou
-        FROM gt_bbox gt
-        CROSS JOIN {clusters_table} det
-        WHERE st_intersects(gt.geometry, det.cluster_bbox)
+        FROM {gt_view} gt
+        CROSS JOIN {det_table} det
+        WHERE st_intersects(gt.geometry, det.{det_geom_col})
     """)
 
-    # Best matching IoU per cluster (precision side) and per ground truth (recall side).
+    # Best matching IoU per detection (precision side) and per ground truth (recall side).
     spark.sql(f"""
-        CREATE OR REPLACE TEMP VIEW det_match AS
+        CREATE OR REPLACE TEMP VIEW {det_match_view} AS
         SELECT det.image_path,
-               det.cluster_id,
+               det.{det_id_col} AS det_id,
                COALESCE(MAX(p.iou), 0.0) AS best_iou
-        FROM {clusters_table} det
-        LEFT JOIN pair_iou p USING (image_path, cluster_id)
-        GROUP BY det.image_path, det.cluster_id
+        FROM {det_table} det
+        LEFT JOIN {pair_view} p
+            ON det.image_path = p.image_path
+            AND det.{det_id_col} = p.det_id
+        GROUP BY det.image_path, det.{det_id_col}
     """)
     spark.sql(f"""
-        CREATE OR REPLACE TEMP VIEW gt_match AS
+        CREATE OR REPLACE TEMP VIEW {gt_match_view} AS
         SELECT gt.gt_id,
                COALESCE(MAX(p.iou), 0.0) AS best_iou
-        FROM gt_bbox gt
-        LEFT JOIN pair_iou p USING (gt_id)
+        FROM {gt_view} gt
+        LEFT JOIN {pair_view} p USING (gt_id)
         GROUP BY gt.gt_id
     """)
 
     det_count, det_tp = spark.sql(
-        f"SELECT COUNT(*), SUM(CASE WHEN best_iou >= {IOU_MATCH_THRESHOLD} THEN 1 ELSE 0 END) FROM det_match"
+        f"SELECT COUNT(*), SUM(CASE WHEN best_iou >= {iou_threshold} THEN 1 ELSE 0 END) FROM {det_match_view}"
     ).first()
     gt_count, gt_tp = spark.sql(
-        f"SELECT COUNT(*), SUM(CASE WHEN best_iou >= {IOU_MATCH_THRESHOLD} THEN 1 ELSE 0 END) FROM gt_match"
+        f"SELECT COUNT(*), SUM(CASE WHEN best_iou >= {iou_threshold} THEN 1 ELSE 0 END) FROM {gt_match_view}"
     ).first()
 
     det_count, gt_count = int(det_count or 0), int(gt_count or 0)
@@ -1094,20 +1270,151 @@ else:
     recall    = gt_tp  / gt_count  if gt_count  else 0.0
     f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
-    print(f"IoU match threshold  : {IOU_MATCH_THRESHOLD}")
+    print(f"--- Evaluation: {label} ---")
+    print(f"Detection table      : {det_table}")
+    print(f"GT geometry          : {'envelope' if envelope_gt else 'raw polygon'}")
+    print(f"IoU match threshold  : {iou_threshold}")
     print(f"Ground-truth count   : {gt_count}")
-    print(f"Cluster count        : {det_count}")
-    print(f"Clusters matched     : {det_tp}    -> precision = {precision:.3f}")
+    print(f"Detection count      : {det_count}")
+    print(f"Detections matched   : {det_tp}    -> precision = {precision:.3f}")
     print(f"Ground-truth matched : {gt_tp}    -> recall    = {recall:.3f}")
     print(f"F1                   : {f1:.3f}")
+
+    return {
+        "label": label,
+        "det_table": det_table,
+        "envelope_gt": envelope_gt,
+        "iou_threshold": iou_threshold,
+        "gt_count": gt_count,
+        "det_count": det_count,
+        "det_tp": det_tp,
+        "gt_tp": gt_tp,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Evaluate bounding-box detections
+
+# COMMAND ----------
+
+# Source flips with `RUN_DISSOLVE`: cluster envelopes when on, raw
+# per-detection geometries when off. Both share `image_path` but use
+# different per-row keys and a different geometry column.
+if RUN_DISSOLVE:
+    bbox_metrics = evaluate_against_ground_truth(
+        det_table=clusters_table,
+        det_id_col="cluster_id",
+        det_geom_col="cluster_bbox",
+        envelope_gt=True,
+        label="clusters",
+    )
+else:
+    bbox_metrics = evaluate_against_ground_truth(
+        det_table=boxes_table,
+        det_id_col="box_idx",
+        det_geom_col="geometry",
+        envelope_gt=True,
+        label="boxes",
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Evaluate segmentation polygons
+# MAGIC
+# MAGIC Skipped when `RUN_SEGMENTATION = False`. Segmentation polygons trace
+# MAGIC the structure shape directly, so the ground-truth polygons are used
+# MAGIC as-is (no envelope step).
 
 # COMMAND ----------
 
 if RUN_SEGMENTATION:
-    from base64 import b64encode
+    seg_metrics = evaluate_against_ground_truth(
+        det_table=segments_table,
+        det_id_col="seg_idx",
+        det_geom_col="geometry",
+        envelope_gt=False,
+        label=f"segments_{SEGMENTER_VERSION}",
+    )
 
-    png_bytes = spark.table(segmentation_table).select("mask").sort("image_path", ascending=True).first().mask
+# COMMAND ----------
 
-    displayHTML(f'<img src="data:image/png;base64,{b64encode(png_bytes).decode("ascii")}" height=300/>')
-else:
-    print("RUN_SEGMENTATION=False -- no mask column to preview.")
+# MAGIC %md
+# MAGIC ## Widget definitions
+# MAGIC
+# MAGIC Everything below `dbutils.notebook.exit()` is skipped on a normal "Run
+# MAGIC All". Run the next cell once to declare/refresh the notebook's widget
+# MAGIC bar; on jobs the bar is populated from `base_parameters` in
+# MAGIC `resources/ray_inference.job.yml` and this cell never needs to run.
+# MAGIC
+# MAGIC The widgets exposed here are the run-time knobs the read cell at the
+# MAGIC top of the notebook consumes:
+# MAGIC
+# MAGIC - `text_prompt` -- comma-separated open-vocabulary detection prompt.
+# MAGIC - `BBOX_MODEL` -- one of `owlv2`, `grounding_dino`, `omdet`. OWLv2 is
+# MAGIC   the strongest stock choice on this aerial AOI; grounding_dino has
+# MAGIC   broader text matching but more false positives; omdet is fastest
+# MAGIC   but weakest.
+# MAGIC - `RUN_SEGMENTATION` -- `true` to run SAM2/SAM3, `false` to stop after
+# MAGIC   the bbox + IoU-against-ground-truth stage.
+# MAGIC - `SEGMENTER_VERSION` -- `samgeo2` (SamGeo2 / sam2-hiera-small) or
+# MAGIC   `samgeo3` (SamGeo3 / facebook/sam3, transformers backend).
+# MAGIC - `RUN_DISSOLVE` -- `true` to buffer-and-union overlapping bbox
+# MAGIC   detections into cluster envelopes before the segmenter sees them
+# MAGIC   (essential for Thames; muddies Norfolk's small/close structures).
+# MAGIC - `CATALOG`, `SCHEMA`, `VOLUME` -- Unity Catalog locations for input
+# MAGIC   imagery and output tables.
+# MAGIC - `image_path` -- full Volumes path to the source image.
+# MAGIC - `SRID` -- EPSG code for the source imagery's CRS (default 27700).
+# MAGIC - `IOU_MATCH_THRESHOLD` -- min IoU above which a detection counts as
+# MAGIC   a true positive in the per-detection precision/recall/F1 summary.
+
+# COMMAND ----------
+
+dbutils.notebook.exit("done")
+
+# COMMAND ----------
+
+# This cell is dormant on a "Run All" because the cell above exits the
+# notebook. Run it manually once (or via Run > Run cell) to populate the
+# widget bar. Repeated runs harmlessly re-declare each widget at its
+# default value, then `removeAll()` strips any widgets from earlier
+# notebook revisions.
+dbutils.widgets.removeAll()
+
+dbutils.widgets.text("text_prompt", "pier", "Detection prompt (comma-separated)")
+dbutils.widgets.dropdown(
+    "BBOX_MODEL", "owlv2",
+    ["owlv2", "grounding_dino", "omdet"],
+    "Bounding-box detector",
+)
+dbutils.widgets.dropdown(
+    "RUN_SEGMENTATION", "true",
+    ["true", "false"],
+    "Run segmentation",
+)
+dbutils.widgets.dropdown(
+    "SEGMENTER_VERSION", "samgeo2",
+    ["samgeo2", "samgeo3"],
+    "Segmentation backend",
+)
+dbutils.widgets.dropdown(
+    "RUN_DISSOLVE", "true",
+    ["true", "false"],
+    "Dissolve overlapping detections",
+)
+dbutils.widgets.text("CATALOG", "stuart",  "Catalog")
+dbutils.widgets.text("SCHEMA",  "tce",     "Schema")
+dbutils.widgets.text("VOLUME",  "imagery", "Volume")
+dbutils.widgets.text(
+    "image_path",
+    "/Volumes/stuart/tce/imagery/NorfolkAOI/Ortho_RGBN_P00116896_20240623_20240623_20cm_res.ecw",
+    "Source image path",
+)
+dbutils.widgets.text("SRID", "27700", "Source CRS (EPSG)")
+dbutils.widgets.text("IOU_MATCH_THRESHOLD", "0.5", "IoU threshold for TP")
+
